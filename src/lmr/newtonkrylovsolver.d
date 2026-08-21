@@ -15,7 +15,6 @@ import core.time : MonoTime;
 import core.stdc.stdlib : exit;
 import core.stdc.string : memcpy;
 import std.algorithm : min;
-import std.algorithm.searching : countUntil;
 import std.array : appender;
 import std.conv : to;
 import std.datetime : DateTime, Clock, SysTime;
@@ -491,8 +490,29 @@ enum WallTimeIndex {
     frechetDerivative,
     krylovOperations,
     perturbationSize,
+    inviscidFlux,
+    viscousFlux,
+    sourceTerms,
+    timeDerivatives,
     count
 }
+enum string[] wallTimeHeaderNames = [
+    "solver-linear-wall-time",
+    "solver-pc-setup-wall-time",
+    "solver-pc-apply-wall-time",
+    "solver-physicality-check-wall-time",
+    "solver-line-search-wall-time",
+    "solver-frechet-derivative-wall-time",
+    "solver-krylov-operations-wall-time",
+    "solver-perturbation-size-wall-time",
+    "residual-inviscid-wall-time",
+    "residual-viscous-wall-time",
+    "residual-source-wall-time",
+    "residual-time-derivatives-wall-time"
+];
+static assert(wallTimeHeaderNames.length == WallTimeIndex.count,
+              "wallTimeHeaderNames must match WallTimeIndex");
+
 static long[WallTimeIndex.count] routineWallTimeTicks = 0;
 
 long elapsedTicks(long start)
@@ -3493,6 +3513,7 @@ void evalResidualWorker(int ftl)
         }
     }
 
+    auto inviscidFluxWallTimeStart = MonoTime.currTime().ticks;
     bool allow_high_order_interpolation = true;
     foreach (blk; parallel(localFluidBlocks,1)) {
         if (GlobalConfig.grid_motion == GridMotion.shock_fitting) {
@@ -3523,8 +3544,10 @@ void evalResidualWorker(int ftl)
     foreach (blk; localFluidBlocks) {
         blk.applyPostConvFluxAction(SimState.time, gtl, ftl);
     }
+    routineWallTimeTicks[WallTimeIndex.inviscidFlux] += elapsedTicks(inviscidFluxWallTimeStart);
 
     if (GlobalConfig.viscous) {
+        auto viscousFluxWallTimeStart = MonoTime.currTime().ticks;
         foreach (blk; localFluidBlocks) {
             blk.applyPreSpatialDerivActionAtBndryFaces(SimState.time, gtl, ftl);
             blk.applyPreSpatialDerivActionAtBndryCells(SimState.time, gtl, ftl);
@@ -3563,8 +3586,10 @@ void evalResidualWorker(int ftl)
         foreach (blk; localFluidBlocks) {
             blk.applyPostDiffFluxAction(SimState.time, gtl, ftl);
         }
+        routineWallTimeTicks[WallTimeIndex.viscousFlux] += elapsedTicks(viscousFluxWallTimeStart);
     }
 
+    auto sourceTermsWallTimeStart = MonoTime.currTime().ticks;
     foreach (blk; parallel(localFluidBlocks,1)) {
         if (blk.myConfig.conductivity_model) { blk.evaluate_electrical_conductivity(); }
         // the limit_factor is used to slowly increase the magnitude of the
@@ -3585,8 +3610,14 @@ void evalResidualWorker(int ftl)
         }
         blk.eval_udf_source_vectors(SimState.time, gtl);
         blk.add_udf_source_vectors();
+    }
+    routineWallTimeTicks[WallTimeIndex.sourceTerms] += elapsedTicks(sourceTermsWallTimeStart);
+
+    auto timeDerivativesWallTimeStart = MonoTime.currTime().ticks;
+    foreach (blk; parallel(localFluidBlocks,1)) {
         blk.time_derivatives(gtl, ftl);
     }
+    routineWallTimeTicks[WallTimeIndex.timeDerivatives] += elapsedTicks(timeDerivativesWallTimeStart);
 }
 
 void setJacobianEvalSettings(bool for_preconditioning)
@@ -4196,7 +4227,10 @@ void initialiseDiagnosticsFile()
     foreach (ivar; 0 .. cfg.cqi.n) {
         header ~= format("%s-abs %s-rel ", cfg.cqi.names[ivar], cfg.cqi.names[ivar]);
     }
-    header ~= "linear-solve-wall-time preconditioner-setup-wall-time preconditioner-apply-wall-time physicality-check-wall-time line-search-wall-time frechet-derivative-wall-time krylov-operations-wall-time perturbation-size-wall-time";
+    foreach (headerName; wallTimeHeaderNames) {
+        header ~= headerName ~ " ";
+    }
+    header.length--;
     diagnostics.writeln(header);
     diagnostics.close();
 }
@@ -4240,15 +4274,9 @@ void writeDiagnostics(int step, double dt, double cfl, double wallClockElapsed, 
     foreach (ivar; 0 .. cfg.cqi.n) {
         diagnostics.writef("%20.16e %20.16e ", currentResiduals[ivar].re, currentResiduals[ivar].re/referenceResiduals[ivar].re);
     }
-    diagnostics.writef("%.8f %.8f %.8f %.8f %.8f %.8f %.8f %.8f",
-                       routineWallTimes[WallTimeIndex.linearSolve],
-                       routineWallTimes[WallTimeIndex.preconditionerSetup],
-                       routineWallTimes[WallTimeIndex.preconditionerApply],
-                       routineWallTimes[WallTimeIndex.physicalityCheck],
-                       routineWallTimes[WallTimeIndex.lineSearch],
-                       routineWallTimes[WallTimeIndex.frechetDerivative],
-                       routineWallTimes[WallTimeIndex.krylovOperations],
-                       routineWallTimes[WallTimeIndex.perturbationSize]);
+    foreach (wallTime; routineWallTimes) {
+        diagnostics.writef("%.8f ", wallTime);
+    }
     diagnostics.writef("\n");
     diagnostics.close();
 }
